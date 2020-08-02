@@ -298,7 +298,7 @@ class NormalInstrument(Instrument):
     def measure(self, true_time):
         """Produces a measurement of time at the supplied true time."""
         server_time = super().server_time(true_time)
-        utc = numpy.random.normal(raw_time, self.error_sigma)
+        utc = numpy.random.normal(server_time, self.error_sigma)
         return Measurement(true_time, utc, self.error_sigma)
 
 
