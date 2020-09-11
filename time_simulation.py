@@ -92,7 +92,6 @@ class SimulationOutput:
         prev_stats[2] += len(abs_data)
         prev_stats[3] += sum([d**2 for d in data])
 
-
     @staticmethod
     def print_aggregate(outputs):
         """Prints a table of the aggregate statistics for an iterable of outputs."""
@@ -128,8 +127,6 @@ class SimulationOutput:
         print('RMS estimate error (final 80%)  {:.1f}ms'.format(
             math.sqrt(estimate_errors_80[3]/estimate_errors_80[2]) * SEC_TO_MILLISECONDS))
         print()
-
-
 
     def plot(self):
         """Plots the simulation output as a new matplotlib figure."""
@@ -456,7 +453,7 @@ def perform_run(oscillator, instrument, kalman_filter, span):
     # system would be using oscillator time rather than true time in determining when to make its
     # measurements, but the difference between these is small and the system is not sensitive to
     # the exact time at which a measurement is made.
-    measurement_interval = 60
+    measurement_interval = 120
     oscillator.generate_errors(span)
     out = SimulationOutput(str(instrument))
     for intended_time in range(0, int(span), measurement_interval):
@@ -494,6 +491,32 @@ def run_batch_simulation(instrument, span, runs):
     kalman_filter = KalmanFilter(1.0, assumed_oscillator_variance)
     outputs = [perform_run(oscillator, instrument, kalman_filter, span) for _ in range(runs)]
     SimulationOutput.print_aggregate(outputs)
+
+
+def run_frequency(instrument, span):
+    """Run a simulation once using the supplied instrument and the standard oscillator and kalman
+    filter, printing an average frequency estimate."""
+    oscillator = Oscillator(FIXED_ERROR_SIGMA_PPM, VARIABLE_ERROR_SIGMA_PPM,
+                            VARIABLE_ERROR_PERIOD_SEC)
+    assumed_oscillator_variance = (
+        (FIXED_ERROR_SIGMA_PPM + VARIABLE_ERROR_SIGMA_PPM) / ONE_MILLION)**2
+    kalman_filter = KalmanFilter(1.0, assumed_oscillator_variance)
+    output = perform_run(oscillator, instrument, kalman_filter, span)
+
+    n = len(output.true_time)
+    oscillator_times = [output.true_time[i] + output.oscillator_error[i] for i in range(n)]
+    measurement_times = [output.true_time[i] + output.measurement_error[i] for i in range(n)]
+
+    sum_utc = sum(measurement_times)
+    sum_oscillator = sum(oscillator_times)
+    sum_utc_multiply_oscillator = sum([oscillator_times[i] * measurement_times[i]
+                                      for i in range(n)])
+    sum_utc_squared = sum([measurement_times[i]**2 for i in range(n)])
+    frequency_estimate = ((sum_utc_multiply_oscillator - (sum_utc * sum_oscillator)/n) /
+                          (sum_utc_squared - (sum_utc**2)/n))
+    frequency_estimate_ppm = (frequency_estimate - 1.0) * ONE_MILLION
+    print("Oscillator fixed error (ppm): {:.3f}".format(oscillator.fixed_error))
+    print("Estimated frequency error (ppm): {:.3f}".format(frequency_estimate_ppm))
 
 
 def run_error_visualization(instrument):
@@ -555,6 +578,9 @@ def create_parser():
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument('--simulation', action='store_true',
                         help="Run the simulation one time and plots the results.")
+    modes.add_argument('--frequency', action='store_true',
+                        help="Run the simulation one time and plots a frequency estimate over "
+                             "the results.")
     modes.add_argument('--simulations', action='store', type=int, metavar='N',
                         help="Run the simulation multiple times and tabulates performance.")
     modes.add_argument('--errors', action='store_true', 
@@ -567,11 +593,12 @@ def create_parser():
                              "is the standard deviation in milliseconds.")
     instruments.add_argument('--network', action='store',  metavar='PROPS',
                         help="Use a instrument with error based on network delays. Value is min "
-                             "network latency in milliseconds, comma, modal latency in seconds.")
+                             "network latency in milliseconds, comma, modal latency in "
+                             "milliseconds.")
     instruments.add_argument('--quantized', action='store',  metavar='PROPS',
                         help="Use a instrument with error based on network delays and quantized "
                              "communication. Value is min network latency in milliseconds, comma, "
-                             "modal latency in seconds, comma, quantum in milliseconds.")
+                             "modal latency in milliseconds, comma, quantum in milliseconds.")
     return parser
 
 
@@ -602,7 +629,9 @@ def main():
     if args.simulation:
         run_simulation(instrument, args.span * MINUTES_TO_SEC)
     if args.simulations:
-        run_batch_simulation(instrument, srgs.span * MINUTES_TO_SEC, args.simulations)
+        run_batch_simulation(instrument, args.span * MINUTES_TO_SEC, args.simulations)
+    if args.frequency:
+        run_frequency(instrument, args.span * MINUTES_TO_SEC)
     elif args.errors:
         run_error_visualization(instrument)
     elif args.binnederrors:
