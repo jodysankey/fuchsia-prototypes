@@ -693,8 +693,11 @@ def create_parser():
                              "modal latency in milliseconds, comma, quantum in milliseconds.")
     instruments.add_argument('--cquantized', action='store',  metavar='PROPS',
                         help="Use a instrument with error based on network delays and quantized "
-                             "communication. Value is min network latency in milliseconds, comma, "
-                             "modal latency in milliseconds, comma, quantum in milliseconds.")
+                             "communication. The instrument polls multiple times to achieve better "
+                             "accuracy. Value is min network latency in milliseconds, comma, modal "
+                             "latency in milliseconds, comma, quantum in milliseconds, comma, mode. "
+                             "Mode determines the strategy used to determine how long to wait "
+                             "between polls. Accepted values for mode are 'random' and 'choose'.")
     return parser
 
 
