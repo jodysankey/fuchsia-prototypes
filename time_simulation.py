@@ -6,6 +6,7 @@ for Fuchsia."""
 import argparse
 import math
 import random
+import collections
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -403,6 +404,97 @@ class QuantizedNetworkInstrument(Instrument):
         return Measurement(assumed_measurement_true, assumed_utc, sigma, rtt=rtt,
                            max_p_window=self.quantum)
 
+class CombinedQuantizedNetworkInstrument(Instrument):
+    """A model of an instrument that polls a quantized network instrument multiple times to improve
+    accuracy.
+    """
+    MIN_SEC_BETWEEN_POLLS = 10
+    POLLS_PER_SAMPLE = 4
+
+    @staticmethod
+    def from_args(arg_string):
+        """Creates a new CombinedQuantizedNetworkInstrument using the supplied command line argument."""
+        params = arg_string.split(',')
+        if len(params) != 4:
+            raise ValueError('CombinedQuantizedNetwork properties must contain 4 comma separated values')
+        min_delay = int(params[0]) * MILLISECONDS_TO_SEC
+        modal_delay = int(params[1]) * MILLISECONDS_TO_SEC
+        quantum = int(params[2]) * MILLISECONDS_TO_SEC
+        mode = params[3]
+        return CombinedQuantizedNetworkInstrument(Network(min_delay, modal_delay), quantum, mode)
+
+    def __init__(self, network, quantum, mode):
+        """Creates a new NetworkInstrument measuing time to the supplied Server with delays induced
+        by the supplied Network and timestamps truncated to a multiple of quantum."""
+        self.network = network
+        self.quantum = quantum
+        self.mode = mode
+        Instrument.__init__(self)
+
+    def __str__(self):
+        return 'Combined Quantized network instrument, quantum={:.0f}ms, network delay {}'.format(
+            self.quantum * SEC_TO_MILLISECONDS, str(self.network))
+
+    def _measure(self, true_time):
+        """Produce a bound on the real UTC time beginning at true_time"""
+        # Calculate two independent delays for the inbound and outbound packets. Server processing
+        # time is small in comparison so we assume it it included in the packet delay distributions.
+        out_delay, in_delay = self.network.packet_delay(), self.network.packet_delay()
+        # The server time was measured when the server received the packet....
+        utc = self.server_time(true_time + out_delay)
+        # ... but the time was sent over the network with lower resolution....
+        quantized_utc = utc - math.fmod(utc, self.quantum)
+        # Our instrument also has no idea how the RTT it sees was split between send and receive
+        # and so it has to assume the measurement was taken midway through RTT.
+        rtt = in_delay + out_delay
+        delta = rtt / 2
+        assumed_measurement_true = true_time + delta
+        return ((assumed_measurement_true, quantized_utc - delta, quantized_utc + self.quantum + delta), delta)
+
+    def _combine(self, earlier_bound, later_bound):
+        time_diff = later_bound[0] - earlier_bound[0]
+        # Calculate a worst case error due to drift.
+        time_diff_err = time_diff*FIXED_ERROR_SIGMA_PPM*3.0/ONE_MILLION
+        # Add time diff to each time entry.
+        updated_earlier = (earlier_bound[0] + time_diff, \
+            earlier_bound[1] + time_diff - time_diff_err, \
+            earlier_bound[2] + time_diff + time_diff_err)
+        # if intervals don't overlap we can't combine
+        if later_bound[1] > updated_earlier[2] or later_bound[2] < updated_earlier[1]:
+            return None
+        return (later_bound[0], \
+            max(later_bound[1], updated_earlier[1]), \
+            min(later_bound[2], updated_earlier[2]))
+
+    def _ideal_time(self, prev_bounds):
+        if self.mode == 'random':
+            return prev_bounds[0] + self.MIN_SEC_BETWEEN_POLLS + \
+                numpy.random.uniform(low=0.0, high=self.quantum)
+        elif self.mode == 'choose':
+            # Try to choose a start time so that the bound size can be halved when combined with
+            # the new bound.
+            additional_subsec = self.quantum - math.fmod((prev_bounds[1] + prev_bounds[2])/2, self.quantum)
+            return prev_bounds[0] + self.MIN_SEC_BETWEEN_POLLS + additional_subsec
+
+    def measure(self, true_time):
+        """Produces a measurement of time beginning at the supplied true_time."""
+        # even for the initial sample offset by some random quantization
+        bounds, delta = self._measure(true_time + numpy.random.uniform(low=0.0, high=self.quantum))
+        deltas = [delta]
+        for i in range(1, self.POLLS_PER_SAMPLE):
+            ideal_time = self._ideal_time(bounds)
+            # subtract estimate of delta so that our time is roughly around the desired true time
+            approximated_delta = sum(deltas) / len(deltas)
+            adj_true_time = ideal_time - approximated_delta
+            new_bounds, new_delta = self._measure(adj_true_time)
+            deltas.append(new_delta)
+            bounds = self._combine(bounds, new_bounds)
+        assumed_monotonic = bounds[0]
+        assumed_utc = (bounds[1] + bounds[2]) / 2
+        # estimate sigma based on the size of the final bound. This value was eyeballed from
+        # binnederror results where bins were based on bound size.
+        sigma = (bounds[2] - bounds[1]) / 5
+        return Measurement(assumed_monotonic, assumed_utc, sigma)
 
 class KalmanFilter:
     """A simple Kalman filter that consumes measurements to track time.
@@ -599,6 +691,13 @@ def create_parser():
                         help="Use a instrument with error based on network delays and quantized "
                              "communication. Value is min network latency in milliseconds, comma, "
                              "modal latency in milliseconds, comma, quantum in milliseconds.")
+    instruments.add_argument('--cquantized', action='store',  metavar='PROPS',
+                        help="Use a instrument with error based on network delays and quantized "
+                             "communication. The instrument polls multiple times to achieve better "
+                             "accuracy. Value is min network latency in milliseconds, comma, modal "
+                             "latency in milliseconds, comma, quantum in milliseconds, comma, mode. "
+                             "Mode determines the strategy used to determine how long to wait "
+                             "between polls. Accepted values for mode are 'random' and 'choose'.")
     return parser
 
 
@@ -625,6 +724,8 @@ def main():
         instrument = NetworkInstrument.from_args(args.network)
     elif args.quantized is not None:
         instrument = QuantizedNetworkInstrument.from_args(args.quantized)
+    elif args.cquantized is not None:
+        instrument = CombinedQuantizedNetworkInstrument.from_args(args.cquantized)
 
     if args.simulation:
         run_simulation(instrument, args.span * MINUTES_TO_SEC)
